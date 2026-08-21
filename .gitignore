@@ -1,10 +1,7 @@
 *.mp4
 *.png
 package-lock.json
-widevideo/
 *.jpeg
 *.jpg
 .\node_modules\
-*.mp4
-*.png
 .\package-lock.json
