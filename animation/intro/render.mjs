@@ -8,11 +8,12 @@
 // is exact canvas pixels regardless of how CSS scales the element for preview.
 
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 import { startServer, PAGE_PATH } from './server.mjs';
+import { stalePhases } from './extract-plates.mjs';
+import { runFfmpeg } from './ffmpeg.mjs';
 
 const HERE = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const FRAME_DIR = resolve(HERE, 'frames');
@@ -59,6 +60,18 @@ const makeVideo = !process.argv.includes('--no-video');
 // open handle keeps the process alive forever.
 const chrome = findChrome();
 
+// A missing or stale plate cache would otherwise render as silently black
+// footage phases — 14 seconds of nothing, discovered only on playback.
+const stale = stalePhases();
+if (stale.length) {
+  console.error(
+    `footage plates are missing or out of date for: ${stale.join(', ')}
+` +
+    '  Run `npm run plates` first (it needs the source clips on disk).'
+  );
+  process.exit(1);
+}
+
 rmSync(FRAME_DIR, { recursive: true, force: true });
 mkdirSync(FRAME_DIR, { recursive: true });
 
@@ -94,8 +107,8 @@ try {
   console.log(`rendering ${frames} frames at 1920x1080, ${fps}fps...`);
 
   for (let f = 0; f < frames; f++) {
-    const dataUrl = await page.evaluate((n) => {
-      window.INTRO.seek(n);
+    const dataUrl = await page.evaluate(async (n) => {
+      await window.INTRO.seek(n);
       return document.getElementById('c').toDataURL('image/png');
     }, f);
     if (!dataUrl.startsWith(PNG_PREFIX)) {
@@ -119,36 +132,22 @@ if (!makeVideo) {
   process.exit(0);
 }
 
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-
-const ff = spawnSync(FFMPEG, [
-  '-y',
-  '-framerate', String(fps),
-  '-i', resolve(FRAME_DIR, 'frame_%04d.png'),
-  '-c:v', 'libx264',
-  '-preset', 'slow',
-  '-crf', '16',
-  '-pix_fmt', 'yuv420p',
-  '-r', String(fps),
-  '-movflags', '+faststart',
-  OUT_MP4,
-], { stdio: 'inherit' });
-
-// ff.status is null when the binary could not be spawned at all, so checking
-// only the status reports "ffmpeg failed" for what is really "ffmpeg missing".
-if (ff.error) {
-  const missing = ff.error.code === 'ENOENT';
-  console.error(
-    missing
-      ? `ffmpeg not found (tried "${FFMPEG}"). Install it or set FFMPEG_PATH to the executable.\n` +
-        '  On Windows a scoop/choco shim may be a .cmd — point FFMPEG_PATH at it directly.'
-      : `could not run ffmpeg: ${ff.error.message}`
-  );
+try {
+  runFfmpeg([
+    '-y',
+    '-framerate', String(fps),
+    '-i', resolve(FRAME_DIR, 'frame_%04d.png'),
+    '-c:v', 'libx264',
+    '-preset', 'slow',
+    '-crf', '16',
+    '-pix_fmt', 'yuv420p',
+    '-r', String(fps),
+    '-movflags', '+faststart',
+    OUT_MP4,
+  ]);
+} catch (e) {
+  console.error(e.message);
   console.error(`frames are still in ${FRAME_DIR}`);
   process.exit(1);
-}
-if (ff.status !== 0) {
-  console.error(`ffmpeg exited ${ff.status} — frames are still in ${FRAME_DIR}`);
-  process.exit(ff.status ?? 1);
 }
 console.log(`\ndone: ${OUT_MP4}`);

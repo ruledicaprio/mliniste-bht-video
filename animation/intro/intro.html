@@ -64,6 +64,7 @@ import {
   FPS, DUR, FRAMES, W, H, frameToTime,
   clamp01, ramp, easeOut, easeInOut, window4, lerp,
   hexToRgb, rgba,
+  PHASES, phaseProgress, plateIndex, footagePhaseAt,
 } from './timing.mjs';
 
 /* --- palette ------------------------------------------------------------- */
@@ -90,6 +91,45 @@ const COVERAGE_BOX = { x0: 0.251, y0: 0.154, x1: 0.973, y1: 0.919 };
 
 /* --- map placement on the 1920x1080 frame --------------------------------- */
 const MAP = { x: 210, y: 40, w: 1000, h: 1000 };
+
+/* --- act 1 -> footage handover -------------------------------------------
+   The graphic act used to end at 9.4 s because the clip did. It no longer
+   does: the map has to survive the push-in and dissolve into the drone shot,
+   so its layers now fade out over MAP_OUT instead. These two numbers are the
+   only act-1 keyframes that moved — every ramp before them still fires at the
+   second it always did.                                                      */
+const MAP_OUT = [12.2, 13.9];
+
+/* The coverage raster leaves ahead of the map. At full zoom it is a flat
+   orange field, and the descent wants to land on the road — which is what the
+   drone shot is about to show for real — not on a colour wash.               */
+const COVERAGE_OUT = [10.4, 12.4];
+
+/* National-scale furniture (service chips, the callout leader and label) is
+   meaningless once the camera starts descending, so it leaves ahead of the
+   map itself.                                                                */
+const HUD_OUT = [9.0, 9.9];
+
+/* Push-in. The map scales about the reticle, so the site pixel never moves;
+   ZOOM_MAX is a look, not a real scale factor — the map is a whole country
+   and the frame is meant to go soft and abstract before the dissolve, which
+   is what ZOOM_BLUR does over the last third of the move.                    */
+const ZOOM_MAX = 9.0;
+const ZOOM_BLUR = 7;              // px of blur at full zoom
+
+/* Footage. PLATE_FADE crossfades the first drone frame up over the zoom's
+   tail; CUT_DIP is the short dip to black that covers each straight cut
+   between footage phases — set it to 0 for hard cuts.                        */
+const PLATE_FADE = [12.6, 14.0];
+const CUT_DIP = 0.18;             // seconds, half either side of the cut
+
+/* Scanlines read as texture over graphics and as dirt over real footage. */
+const SCANLINE_ALPHA = { graphic: 0.06, footage: 0.02 };
+
+/* How many decoded footage frames to keep. Each is a 1920x1080 bitmap (~8 MB
+   decoded), so this is a hard memory ceiling, not a hint — preloading the
+   whole 444-frame cache would be ~3.5 GB.                                    */
+const PLATE_CACHE = 6;
 
 const canvas = document.getElementById('c');
 // Frame size comes from timing.mjs, not the markup — one source of truth that
@@ -175,6 +215,29 @@ async function loadCoverageMask() {
   }
   c.putImageData(data, 0, 0);
   return off;
+}
+
+/* ============================ footage plates ==============================
+   Live footage enters the render as pre-extracted, pre-resampled frames (see
+   extract-plates.mjs): output frame N of a footage phase is plate N of that
+   phase's directory, one JPEG per frame at a flat 30 fps. Nothing here has to
+   know that the sources are 30000/1001.                                      */
+
+const plateCache = new Map();     // insertion-ordered, so it evicts FIFO
+
+async function loadPlate(phase, idx) {
+  const key = `${phase}/${String(idx).padStart(4, '0')}`;
+  const hit = plateCache.get(key);
+  if (hit) return hit;
+
+  const bmp = await createImageBitmap(await (await fetchOk(`./plates/${key}.jpg`)).blob());
+  plateCache.set(key, bmp);
+  if (plateCache.size > PLATE_CACHE) {
+    const [oldest, old] = plateCache.entries().next().value;
+    old.close?.();
+    plateCache.delete(oldest);
+  }
+  return bmp;
 }
 
 const assets = {};
@@ -300,7 +363,7 @@ function drawBackdropGrid(t) {
 }
 
 function drawMap(t) {
-  const a = window4(t, 0.6, 1.7, 8.6, 9.4);
+  const a = window4(t, 0.6, 1.7, ...MAP_OUT);
   if (a <= 0.001) return;
   const grow = lerp(0.955, 1, easeOut(ramp(t, 0.6, 2.2)));
   ctx.save();
@@ -315,7 +378,7 @@ function drawMap(t) {
 function drawRoute(t) {
   const f = easeInOut(ramp(t, 1.2, 3.5));
   if (f <= 0) return;
-  const fade = window4(t, 1.2, 1.4, 8.6, 9.4);
+  const fade = window4(t, 1.2, 1.4, ...MAP_OUT);
 
   withAlpha(fade * 0.35, () => {                    // outer bloom
     ctx.strokeStyle = ORANGE;
@@ -346,8 +409,29 @@ function drawRoute(t) {
   }
 }
 
+/**
+ * The push-in. Scales the map layers about the site pixel, so the reticle —
+ * which is drawn outside this transform — stays put and stays crisp while the
+ * country blows up underneath it.
+ */
+function withZoom(t, fn) {
+  const p = easeInOut(phaseProgress(t, 'ZOOM'));
+  if (p <= 0) { fn(); return; }
+  const [sx, sy] = pointAt(SITE_T);
+  const z = lerp(1, ZOOM_MAX, p);
+  ctx.save();
+  // Blur only over the back half, where detail runs out and the dissolve starts.
+  const blur = ZOOM_BLUR * easeOut(ramp(p, 0.55, 1));
+  if (blur > 0.05) ctx.filter = `blur(${blur.toFixed(2)}px)`;
+  ctx.translate(sx, sy);
+  ctx.scale(z, z);
+  ctx.translate(-sx, -sy);
+  fn();
+  ctx.restore();
+}
+
 function drawSiteLock(t) {
-  const a = window4(t, 2.9, 3.6, 8.4, 9.2);
+  const a = window4(t, 2.9, 3.6, ...MAP_OUT);
   if (a <= 0.001) return;
   const [sx, sy] = pointAt(SITE_T);
   const settle = easeOut(ramp(t, 2.9, 3.9));
@@ -394,7 +478,8 @@ function drawSiteLock(t) {
   });
 
   // Callout: elbow leader from the reticle out to the right-hand label block.
-  const lead = easeOut(ramp(t, 3.5, 4.2));
+  // It is a national-scale annotation, so it goes before the descent starts.
+  const lead = easeOut(ramp(t, 3.5, 4.2)) * (1 - easeInOut(ramp(t, ...HUD_OUT)));
   const elbowX = sx + 90, labelX = elbowX + 150 * lead, labelY = sy - 92;
   withAlpha(a * lead, () => {
     ctx.strokeStyle = CYAN;
@@ -473,7 +558,7 @@ function drawTelemetry(t) {
 }
 
 function drawCoverage(t) {
-  const a = window4(t, 6.0, 7.0, 8.6, 9.3);
+  const a = window4(t, 6.0, 7.0, ...COVERAGE_OUT);
   if (a <= 0.001) return;
   const [sx, sy] = pointAt(SITE_T);
   // Radial wipe: coverage floods outward from the site until all of BiH is lit.
@@ -514,7 +599,7 @@ function drawCoverage(t) {
   // Service legend.
   const chips = [['GSM', '#7ad1ff'], ['UMTS', '#ffd26a'], ['LTE', ORANGE]];
   chips.forEach(([label, color], i) => {
-    const p = ramp(t, 7.0 + i * 0.16, 7.5 + i * 0.16);
+    const p = ramp(t, 7.0 + i * 0.16, 7.5 + i * 0.16) * (1 - easeInOut(ramp(t, ...HUD_OUT)));
     withAlpha(a * p, () => {
       const cx = 150 + i * 150, cy = 980;
       ctx.fillStyle = 'rgba(4,20,26,0.8)';
@@ -529,43 +614,96 @@ function drawCoverage(t) {
   });
 }
 
-function drawOutro(t) {
-  const scrim = ramp(t, 8.4, 9.2) * 0.88;
-  withAlpha(scrim, () => { ctx.fillStyle = '#02090c'; ctx.fillRect(0, 0, W, H); });
+/* ================================ footage ================================= */
 
-  const a = easeOut(ramp(t, 8.6, 9.4));
+/**
+ * The live-footage base layer. Async because the plate for this exact frame is
+ * fetched and decoded on demand — see the PLATE_CACHE note.
+ */
+async function drawPlate(frame, t) {
+  const phase = footagePhaseAt(frame);
+  if (!phase) return;
+
+  const bmp = await loadPlate(phase, plateIndex(frame, phase));
+  // Only the first footage phase crossfades — it is dissolving out of the map.
+  // The later two are straight cuts covered by CUT_DIP.
+  const a = phase === 'MOTORWAY' ? easeInOut(ramp(t, ...PLATE_FADE)) : 1;
+  withAlpha(a, () => ctx.drawImage(bmp, 0, 0, W, H));
+}
+
+/**
+ * A short dip to black across each straight cut between footage phases. Reads
+ * as a deliberate edit rather than a jump; set CUT_DIP to 0 for hard cuts.
+ */
+function drawCutDips(t) {
+  if (CUT_DIP <= 0) return;
+  for (const name of ['APPROACH', 'SITE']) {
+    const edge = PHASES[name].start;
+    const d = Math.abs(t - edge);
+    if (d >= CUT_DIP) continue;
+    withAlpha(Math.cos((d / CUT_DIP) * Math.PI / 2), () => {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+    });
+  }
+}
+
+/**
+ * The only HUD element that survives into the footage: one corner site tag.
+ * Deliberately less information than feels useful — this is a brand film, and
+ * a data panel over a drone shot reads as noise.
+ */
+function drawFootageTag(t) {
+  const a = window4(t, 14.6, 15.4, PHASES.OUTRO.start - 0.6, PHASES.OUTRO.start + 0.4);
   if (a <= 0.001) return;
+  const x = 120, y = 950;
+  withAlpha(a, () => {
+    ctx.fillStyle = ORANGE;
+    ctx.fillRect(x - 22, y - 26, 4, 34);
+    ctx.fillStyle = '#eaf8ff';
+    ctx.textBaseline = 'alphabetic';
+    mono(30, 700, 4);
+    ctx.fillText(typed(SITE_LABEL, ramp(t, 14.8, 15.8)), x, y);
+  });
+}
+
+/**
+ * Logo and tagline over the tail of the closing shot. Deliberately an overlay,
+ * not a black card: the piece ends on the mountain. The coordinate readout the
+ * original outro carried is gone for good.
+ */
+function drawOutro(t) {
+  const a = easeOut(phaseProgress(t, 'OUTRO'));
+  if (a <= 0.001) return;
+
+  // Partial scrim only — enough to seat white type over a bright sky.
+  withAlpha(ramp(t, 25.6, 27.0) * 0.62, () => {
+    ctx.fillStyle = '#02090c';
+    ctx.fillRect(0, 0, W, H);
+  });
 
   // Logo: settles up into place as it fades in.
   const lw = 520, lh = lw * (100.308 / 206.25372);
-  const rise = lerp(28, 0, easeOut(ramp(t, 8.6, 9.5)));
-  withAlpha(a, () => {
-    ctx.drawImage(assets.logo, (W - lw) / 2, 400 + rise, lw, lh);
+  const lp = easeOut(ramp(t, 25.9, 27.0));
+  withAlpha(lp, () => {
+    ctx.drawImage(assets.logo, (W - lw) / 2, 400 + lerp(28, 0, lp), lw, lh);
   });
 
   // Tagline: letterspacing tightens as it resolves.
-  const tp = ramp(t, 9.0, 9.9);
-  withAlpha(easeOut(tp), () => {
+  const tp = easeOut(ramp(t, 26.4, 27.6));
+  withAlpha(tp, () => {
     ctx.fillStyle = '#eaf8ff';
     ctx.textAlign = 'center';
-    mono(40, 700, lerp(26, 9, easeOut(tp)));
+    mono(40, 700, lerp(26, 9, tp));
     ctx.fillText('IZA PLANINE ISPORUČUJEMO VIŠE', W / 2, 640);
-    ctx.textAlign = 'left';
-  });
-
-  withAlpha(easeOut(ramp(t, 9.3, 10)) * 0.75, () => {
-    ctx.fillStyle = ORANGE;
-    ctx.textAlign = 'center';
-    mono(18, 400, 6);
-    ctx.fillText('MLINIŠTE  ·  44°15\'55"N  16°51\'05"E  ·  1155 m', W / 2, 700);
     ctx.textAlign = 'left';
   });
 }
 
 /** Scanlines + vignette, applied last so everything sits under the same glass. */
-function drawGlass(t) {
+function drawGlass(t, onFootage) {
   ctx.save();
-  ctx.globalAlpha = 0.06;
+  ctx.globalAlpha = onFootage ? SCANLINE_ALPHA.footage : SCANLINE_ALPHA.graphic;
   ctx.fillStyle = '#7fe4ff';
   for (let y = 0; y < H; y += 4) ctx.fillRect(0, y, W, 1);
   ctx.restore();
@@ -577,14 +715,21 @@ function drawGlass(t) {
   ctx.fillRect(0, 0, W, H);
 
   // Opening and closing dips to black keep the clip cuttable at either end.
-  const fade = Math.max(1 - ramp(t, 0, 0.35), ramp(t, 9.75, 10));
+  // The closing dip rides the very end of the timeline, wherever DUR now is.
+  const fade = Math.max(1 - ramp(t, 0, 0.35), ramp(t, DUR - 0.45, DUR));
   if (fade > 0) { ctx.globalAlpha = fade; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
 }
 
 /* ================================ frame =================================== */
 
-function seek(frame) {
+/**
+ * Draws exactly one frame. Async only because footage plates are fetched and
+ * decoded on demand; the drawing itself is still a pure function of the frame
+ * index, so a headless pass and the preview produce identical pixels.
+ */
+async function seek(frame) {
   const t = frameToTime(frame);
+  const onFootage = footagePhaseAt(frame) !== null;
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
@@ -592,15 +737,24 @@ function seek(frame) {
   ctx.fillStyle = INK;
   ctx.fillRect(0, 0, W, H);
 
+  await drawPlate(frame, t);
+
+  // The map layers ride the push-in together so they stay registered to each
+  // other; the reticle sits outside it and holds the centre of frame.
   drawBackdropGrid(t);
-  drawMap(t);
-  drawRoute(t);
+  withZoom(t, () => {
+    drawMap(t);
+    drawRoute(t);
+    drawCoverage(t);
+  });
   drawScanSweep(t);
   drawSiteLock(t);
   // drawTelemetry(t);   // site spec panel — cut as clutter; re-enable to restore
-  drawCoverage(t);
+
+  drawCutDips(t);
+  drawFootageTag(t);
   drawOutro(t);
-  drawGlass(t);
+  drawGlass(t, onFootage);
 }
 
 /* ============================ preview harness ============================= */
@@ -615,12 +769,23 @@ const playBtn = document.getElementById('play');
 scrub.max = String(FRAMES - 1);
 readout.textContent = `frame 0 / ${FRAMES - 1} · 0.00s`;
 
-function show(frame) {
-  seek(frame);
-  // Under ?render=1 the HUD is hidden; skip 300 pointless DOM writes per run.
-  if (isRender) return;
-  scrub.value = String(frame);
-  readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${frameToTime(frame).toFixed(2)}s`;
+// Scrubbing a footage phase can outrun plate decoding. Rather than queue the
+// backlog, keep only the most recent request and drop the rest — the same
+// thing a video scrubber does.
+let drawing = false, pending = null;
+
+async function show(frame) {
+  if (drawing) { pending = frame; return; }
+  drawing = true;
+  try {
+    await seek(frame);
+    if (isRender) return;
+    scrub.value = String(frame);
+    readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${frameToTime(frame).toFixed(2)}s`;
+  } finally {
+    drawing = false;
+    if (pending !== null) { const n = pending; pending = null; show(n); }
+  }
 }
 
 // render.mjs waits on one of these two flags. Without the error channel a
@@ -628,7 +793,7 @@ function show(frame) {
 // full 60s timeout with nothing to show for it.
 try {
   await window.INTRO.ready;
-  show(0);
+  await show(0);
   window.__introReady = true;
 } catch (e) {
   window.__introError = e && e.message ? e.message : String(e);

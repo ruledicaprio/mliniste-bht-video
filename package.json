@@ -10,6 +10,7 @@
     "render": "node animation/intro/render.mjs",
     "frames": "node animation/intro/render.mjs --no-video",
     "route": "node animation/intro/extract-route.mjs",
+    "plates": "node animation/intro/extract-plates.mjs",
     "test": "node --test \"animation/intro/test/*.test.mjs\""
   },
   "engines": {
