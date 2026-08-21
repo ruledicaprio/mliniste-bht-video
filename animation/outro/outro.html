@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="bs">
+<head>
+<meta charset="utf-8">
+<title>Mlinište — Outro</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #000;
+    height: 100%;
+    overflow: hidden;
+  }
+  /* The canvas is always 1920x1080 internally; CSS only scales it for preview. */
+  #stage {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  canvas {
+    width: min(100vw, calc(100vh * 16 / 9));
+    height: auto;
+    display: block;
+  }
+  /* Preview-only scrub bar. render.mjs hides it via ?render=1. */
+  #hud {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 10px 16px;
+    background: rgba(0,0,0,.7);
+    color: #9fe8ff;
+    font: 12px ui-monospace, "Cascadia Mono", Consolas, monospace;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  #hud input { flex: 1; }
+  #hud button { font: inherit; background: #123; color: #9fe8ff; border: 1px solid #2a5c6b; padding: 3px 10px; cursor: pointer; }
+  body.render #hud { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div id="hud">
+  <button id="play">play</button>
+  <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+  <span id="readout">loading…</span>
+</div>
+
+<script type="module">
+/* =============================================================================
+   MLINIŠTE — OUTRO
+   BH Telecom · the film's closing sequence
+
+   The intro run backwards. It cuts straight in from the body edit on the
+   finished site — no graphics, no fade up — then the national map rises out of
+   the footage at full push-in and pulls back to country scale, the coverage
+   floods it, and the brand mark lands. One brand hit, at the end, alone.
+
+   Deterministic: every visual is a pure function of the frame index, so the
+   headless pass and the live preview produce identical pixels.
+
+     window.SCENE.seek(frame)  -> draws exactly that frame
+     window.SCENE.ready        -> resolves once every asset is decoded
+   ========================================================================== */
+
+import {
+  FPS, DUR, FRAMES, W, H, frameToTime,
+  clamp01, ramp, easeOut, easeInOut, window4, lerp,
+  rgba,
+  PHASES, phaseProgress, plateIndex, footagePhaseAt,
+} from './timing.mjs';
+
+import {
+  createScene, MAP, SITE_T, ORANGE, CYAN, INK,
+} from '../shared/scene.mjs';
+
+/* --- footage -> map handover ----------------------------------------------
+   The map dissolves UP out of the drone shot while it is still at full zoom,
+   so what appears first is an unreadable orange-and-teal blur that only
+   resolves into a country as the camera pulls back. MAP_IN has to finish
+   before the footage runs out at 8.4 s, or the frame drops to bare backdrop
+   for a beat.                                                                */
+const MAP_IN = [7.2, 8.6];
+const PLATE_OUT = [8.0, 8.4];
+
+/* Pull-back. Same numbers as the opener's push-in, run the other way: the map
+   scales about the site pixel, so Mlinište holds its position on screen while
+   the country grows outward around it.                                       */
+const ZOOM_MAX = 9.0;
+const ZOOM_BLUR = 7;              // px of blur at full zoom
+
+/* The corridor comes back faintly under the map — enough to tie the ending to
+   the opening without re-tracing it.                                         */
+const ROUTE_IN = [8.2, 9.4];
+const ROUTE_OUT = [12.9, 13.7];
+
+/* Backdrop grid, filling the HUD field the shrinking map uncovers. */
+const GRID_IN = [8.4, 9.8];
+const GRID_OUT = [13.0, 13.8];
+
+/* Coverage. COVERAGE_REVEAL is the radial wipe outward from the site; it runs
+   longer than the alpha so the flood keeps travelling after the layer is
+   fully up.                                                                  */
+const COVERAGE_IN = [9.6, 11.0];
+const COVERAGE_OUT = [13.2, 14.0];
+const COVERAGE_REVEAL = [9.6, 12.4];
+
+/* The site marker. One pip and a ring — this is the origin of the flood, not
+   an annotation, so it carries no label at all.                              */
+const PIP_IN = [9.0, 9.8];
+const PIP_OUT = [13.0, 13.8];
+
+/* Brand. The scrim only has to seat white type over the map, so it stays
+   partial — the coverage stays legible underneath it.                        */
+const SCRIM = [11.6, 12.9];
+const SCRIM_MAX = 0.66;
+const LOGO_IN = [11.9, 12.9];
+const TAGLINE_IN = [12.4, 13.4];
+const TAGLINE = 'IZA PLANINE ISPORUČUJEMO VIŠE';
+
+/* The straight cut between the two footage phases. 0 for a hard cut. */
+const CUT_DIP = 0.18;             // seconds, half either side of the cut
+
+/* Scanlines read as texture over graphics and as dirt over real footage. */
+const SCANLINE_ALPHA = { graphic: 0.06, footage: 0.02 };
+
+/* Hard memory ceiling, not a hint: each plate is a ~8 MB decoded bitmap. */
+const PLATE_CACHE = 6;
+
+/* The closing fade. There is deliberately no opening one — the piece cuts
+   straight in from the body edit.                                            */
+const FADE_OUT = 0.5;             // seconds
+
+const canvas = document.getElementById('c');
+canvas.width = W;
+canvas.height = H;
+const ctx = canvas.getContext('2d', { alpha: false });
+
+let scene = null;
+
+window.SCENE = {
+  fps: FPS,
+  frames: FRAMES,
+  ready: (async () => {
+    scene = await createScene(ctx, { plateRoot: './plates/', plateCache: PLATE_CACHE });
+  })(),
+  seek,
+};
+
+/* ================================ footage ================================= */
+
+/**
+ * The live-footage base layer. Async because the plate for this exact frame is
+ * fetched and decoded on demand — see the PLATE_CACHE note.
+ */
+async function drawPlate(frame, t) {
+  const phase = footagePhaseAt(frame);
+  if (!phase) return;
+
+  const bmp = await scene.loadPlate(phase, plateIndex(frame, phase));
+  // Fades out under the rising map rather than being cut away: by the time the
+  // plates run out the map is already opaque and covering the frame.
+  const a = 1 - easeInOut(ramp(t, ...PLATE_OUT));
+  scene.withAlpha(a, () => ctx.drawImage(bmp, 0, 0, W, H));
+}
+
+/** A short dip to black across the one straight cut between footage phases. */
+function drawCutDip(t) {
+  if (CUT_DIP <= 0) return;
+  const d = Math.abs(t - PHASES.RIDGE.start);
+  if (d >= CUT_DIP) return;
+  scene.withAlpha(Math.cos((d / CUT_DIP) * Math.PI / 2), () => {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  });
+}
+
+/* ============================== the map act =============================== */
+
+/** The HUD field the shrinking map uncovers. Static — the sweep-out was the
+    opener's gesture, and repeating it here would read as a second beginning. */
+function drawBackdropGrid(t) {
+  const a = window4(t, ...GRID_IN, ...GRID_OUT) * 0.5;
+  scene.withAlpha(a, () => {
+    ctx.strokeStyle = '#0d3a48';
+    ctx.lineWidth = 1;
+    const step = 60;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = 0; y <= H; y += step) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+  });
+}
+
+/** The pull-back: the opener's push-in progress, inverted. */
+function withZoom(t, fn) {
+  scene.withZoom(
+    { p: 1 - easeInOut(phaseProgress(t, 'PULLBACK')), zoomMax: ZOOM_MAX, blurMax: ZOOM_BLUR },
+    fn
+  );
+}
+
+function drawMap(t) {
+  scene.drawMap({ alpha: window4(t, ...MAP_IN, DUR - 0.2, DUR) });
+}
+
+function drawRoute(t) {
+  scene.drawRoute({
+    f: 1,                                        // already traced — this is a recall
+    fade: window4(t, ...ROUTE_IN, ...ROUTE_OUT) * 0.8,
+    pulseT: null,                                // no leading hot spot: nothing is drawing
+  });
+}
+
+const coverageAlpha = (t) => window4(t, ...COVERAGE_IN, ...COVERAGE_OUT);
+
+function drawCoverage(t) {
+  scene.drawCoverage({
+    alpha: coverageAlpha(t),
+    reveal: easeOut(ramp(t, ...COVERAGE_REVEAL)) * 1500,
+    // Three staggered rings, launched as the flood starts.
+    rings: [0, 1, 2].map((i) => ramp(t, 9.7 + i * 0.42, 11.5 + i * 0.42)),
+  });
+}
+
+/**
+ * The site marker: a pip and a slow ring at Mlinište, drawn outside the zoom
+ * so it holds its pixel while the country grows around it. No label — per the
+ * standing direction, the ending carries less information than the opening,
+ * not more.
+ */
+function drawSitePip(t) {
+  const a = window4(t, ...PIP_IN, ...PIP_OUT);
+  if (a <= 0.001) return;
+  const [sx, sy] = scene.pointAt(SITE_T);
+  scene.withAlpha(a, () => {
+    ctx.strokeStyle = CYAN;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(sx, sy, 22, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = ORANGE;
+    ctx.beginPath(); ctx.arc(sx, sy, 3.2, 0, Math.PI * 2); ctx.fill();
+  });
+}
+
+/* ================================= brand ================================== */
+
+/**
+ * The film's one brand hit. An overlay on the lit coverage map rather than a
+ * black card — the mark sits on top of what it is claiming.
+ */
+function drawBrand(t) {
+  scene.withAlpha(ramp(t, ...SCRIM) * SCRIM_MAX, () => {
+    ctx.fillStyle = '#02090c';
+    ctx.fillRect(0, 0, W, H);
+  });
+
+  // Logo: settles up into place as it fades in.
+  const lw = 520, lh = lw * (100.308 / 206.25372);
+  const lp = easeOut(ramp(t, ...LOGO_IN));
+  scene.withAlpha(lp, () => {
+    ctx.drawImage(scene.assets.logo, (W - lw) / 2, 400 + lerp(28, 0, lp), lw, lh);
+  });
+
+  // Tagline: letterspacing tightens as it resolves.
+  const tp = easeOut(ramp(t, ...TAGLINE_IN));
+  scene.withAlpha(tp, () => {
+    ctx.fillStyle = '#eaf8ff';
+    ctx.textAlign = 'center';
+    scene.mono(40, 700, lerp(26, 9, tp));
+    ctx.fillText(TAGLINE, W / 2, 640);
+    ctx.textAlign = 'left';
+  });
+}
+
+function drawGlass(t, onFootage) {
+  scene.drawGlass({
+    scanlineAlpha: onFootage ? SCANLINE_ALPHA.footage : SCANLINE_ALPHA.graphic,
+    // Closing dip only. The first frame is picture, not black.
+    fade: ramp(t, DUR - FADE_OUT, DUR),
+  });
+}
+
+/* ================================ frame =================================== */
+
+async function seek(frame) {
+  const t = frameToTime(frame);
+  const onFootage = footagePhaseAt(frame) !== null;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.filter = 'none';
+  ctx.fillStyle = INK;
+  ctx.fillRect(0, 0, W, H);
+
+  await drawPlate(frame, t);
+  drawBackdropGrid(t);
+
+  // The map layers ride the pull-back together so they stay registered to each
+  // other; the site pip sits outside it and holds its pixel.
+  withZoom(t, () => {
+    drawMap(t);
+    drawRoute(t);
+    drawCoverage(t);
+  });
+  drawSitePip(t);
+
+  drawCutDip(t);
+  drawBrand(t);
+  drawGlass(t, onFootage);
+}
+
+/* ============================ preview harness ============================= */
+
+const params = new URLSearchParams(location.search);
+const isRender = params.get('render') === '1';
+if (isRender) document.body.classList.add('render');
+
+const scrub = document.getElementById('scrub');
+const readout = document.getElementById('readout');
+const playBtn = document.getElementById('play');
+scrub.max = String(FRAMES - 1);
+readout.textContent = `frame 0 / ${FRAMES - 1} · 0.00s`;
+
+// Scrubbing a footage phase can outrun plate decoding. Rather than queue the
+// backlog, keep only the most recent request and drop the rest.
+let drawing = false, pending = null;
+
+async function show(frame) {
+  if (drawing) { pending = frame; return; }
+  drawing = true;
+  try {
+    await seek(frame);
+    if (isRender) return;
+    scrub.value = String(frame);
+    readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${frameToTime(frame).toFixed(2)}s`;
+  } finally {
+    drawing = false;
+    if (pending !== null) { const n = pending; pending = null; show(n); }
+  }
+}
+
+// render.mjs waits on one of these two flags. Without the error channel a
+// failed asset just leaves __sceneReady unset and the render stalls for the
+// full 60s timeout with nothing to show for it.
+try {
+  await window.SCENE.ready;
+  await show(0);
+  window.__sceneReady = true;
+} catch (e) {
+  window.__sceneError = e && e.message ? e.message : String(e);
+  console.error('outro assets failed:', e);
+}
+
+scrub.addEventListener('input', () => show(Number(scrub.value)));
+
+let playing = false, raf = 0;
+playBtn.addEventListener('click', () => {
+  playing = !playing;
+  playBtn.textContent = playing ? 'pause' : 'play';
+  if (!playing) { cancelAnimationFrame(raf); return; }
+  const t0 = performance.now() - (Number(scrub.value) / FPS) * 1000;
+  const tick = (now) => {
+    if (!playing) return;
+    const f = Math.floor(((now - t0) / 1000) * FPS);
+    if (f >= FRAMES) { playing = false; playBtn.textContent = 'play'; show(FRAMES - 1); return; }
+    show(f);
+    raf = requestAnimationFrame(tick);
+  };
+  raf = requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>

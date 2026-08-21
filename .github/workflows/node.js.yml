@@ -1,9 +1,10 @@
-# Unit tests for the M-15 intro renderer.
+# Unit tests for the intro and outro renderers.
 #
-# Deliberately does not render: that needs a real Chrome and ffmpeg, and the
-# output is a 200 MB frame dump. The suite covers the parts that are pure
-# logic — the SVG path parser, the keyframe timing math, and the preview
-# server — which is where the bugs actually were.
+# Deliberately does not render: that needs a real Chrome, ffmpeg, and the
+# untracked source footage, and the output is a multi-hundred-megabyte frame
+# dump. The suite covers the parts that are pure logic — the SVG path parser,
+# the easing curves, both pieces' phase tables and plate indexing, and the
+# preview server — which is where the bugs actually were.
 
 name: CI
 
