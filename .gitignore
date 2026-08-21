@@ -4,7 +4,8 @@
 #
 # These rules only bind UNTRACKED files: the media was committed anyway and had
 # to be removed from the index with `git rm --cached` before they took effect.
-# It is still in history — see the repo's open item on rewriting that.
+# The history was purged separately on 2026-08-21 — see README, "The history
+# rewrite", for what that did and what GitHub still reports.
 /*.mp4
 /*.jpg
 /*.jpeg
@@ -37,3 +38,11 @@ npm-debug.log*
 
 # Local Claude Code permission allowlist — machine-specific, not shared config.
 .claude/settings.local.json
+
+# Body edit intermediates: one normalized segment per shot, re-encoded by
+# `npm run body` whenever a shot's definition changes.
+animation/body/segments/
+
+# The assembled film. Same reasoning as the pieces above: it is the largest
+# artifact in the repo and `npm run assemble` rebuilds it in seconds from parts.
+/mliniste-full.mp4

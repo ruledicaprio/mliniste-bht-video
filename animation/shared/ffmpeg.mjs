@@ -33,3 +33,31 @@ export function runFfmpeg(args, { quiet = false } = {}) {
   }
   return ff;
 }
+
+export const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
+
+/**
+ * Runs ffprobe and returns its stdout, trimmed.
+ *
+ * Same ENOENT-vs-exit-code distinction as runFfmpeg: the two binaries ship
+ * together, so a missing ffprobe almost always means ffmpeg is not installed
+ * either, and should say so rather than reporting a probe failure.
+ *
+ * @param {string[]} args
+ */
+export function runFfprobe(args) {
+  const fp = spawnSync(FFPROBE, args, { encoding: 'utf8' });
+
+  if (fp.error) {
+    if (fp.error.code === 'ENOENT') {
+      throw new Error(
+        `ffprobe not found (tried "${FFPROBE}"). It ships with ffmpeg — install it or set FFPROBE_PATH.`
+      );
+    }
+    throw new Error(`could not run ffprobe: ${fp.error.message}`);
+  }
+  if (fp.status !== 0) {
+    throw new Error(`ffprobe exited ${fp.status}: ${(fp.stderr || '').trim().split('\n').slice(-4).join('\n')}`);
+  }
+  return fp.stdout.trim();
+}
