@@ -1,4 +1,20 @@
 {
+  "name": "mliniste-bht-video",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BH Telecom Mlinište infrastructure video: source footage plus the deterministic HTML->PNG->MP4 M-15 intro HUD renderer.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "preview": "node animation/intro/server.mjs",
+    "render": "node animation/intro/render.mjs",
+    "frames": "node animation/intro/render.mjs --no-video",
+    "route": "node animation/intro/extract-route.mjs",
+    "test": "node --test \"animation/intro/test/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "dependencies": {
     "puppeteer-core": "^25.8.0"
   }

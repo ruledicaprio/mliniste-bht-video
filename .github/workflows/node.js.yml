@@ -1,7 +1,11 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+# Unit tests for the M-15 intro renderer.
+#
+# Deliberately does not render: that needs a real Chrome and ffmpeg, and the
+# output is a 200 MB frame dump. The suite covers the parts that are pure
+# logic — the SVG path parser, the keyframe timing math, and the preview
+# server — which is where the bugs actually were.
 
-name: Node.js CI
+name: CI
 
 on:
   push:
@@ -10,22 +14,14 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x, 22.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-    - run: npm ci
-    - run: npm run build --if-present
-    - run: npm test
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # puppeteer-core's @puppeteer/browsers requires >=22.12.
+          node-version: '22.x'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test

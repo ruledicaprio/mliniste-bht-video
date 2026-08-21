@@ -43,8 +43,8 @@
 <div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
 <div id="hud">
   <button id="play">play</button>
-  <input id="scrub" type="range" min="0" max="299" value="0" step="1">
-  <span id="readout">frame 0 / 299 · 0.00s</span>
+  <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+  <span id="readout">loading…</span>
 </div>
 
 <script type="module">
@@ -60,10 +60,11 @@
      window.INTRO.ready        -> resolves once every asset is decoded
    ========================================================================== */
 
-const FPS = 30;
-const DUR = 10;                    // seconds
-const FRAMES = FPS * DUR;          // 300
-const W = 1920, H = 1080;
+import {
+  FPS, DUR, FRAMES, W, H, frameToTime,
+  clamp01, ramp, easeOut, easeInOut, window4, lerp,
+  hexToRgb, rgba,
+} from './timing.mjs';
 
 /* --- palette ------------------------------------------------------------- */
 const ORANGE = '#f5821f';          // BH Telecom brand orange (bht-logo.svg)
@@ -91,20 +92,24 @@ const COVERAGE_BOX = { x0: 0.251, y0: 0.154, x1: 0.973, y1: 0.919 };
 const MAP = { x: 210, y: 40, w: 1000, h: 1000 };
 
 const canvas = document.getElementById('c');
+// Frame size comes from timing.mjs, not the markup — one source of truth that
+// render.mjs's viewport also matches.
+canvas.width = W;
+canvas.height = H;
 const ctx = canvas.getContext('2d', { alpha: false });
 
-/* =============================== easing =================================== */
-const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
-/** Normalized progress of t through [a,b], clamped to 0..1. */
-const ramp = (t, a, b) => clamp01((t - a) / (b - a));
-const easeOut = (p) => 1 - Math.pow(1 - p, 3);
-const easeInOut = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
-/** Ramps up over [a,b] and back down over [c,d] — a windowed opacity. */
-const window4 = (t, a, b, c, d) => Math.min(easeOut(ramp(t, a, b)), 1 - easeInOut(ramp(t, c, d)));
-const lerp = (a, b, p) => a + (b - a) * p;
+/* Easing, timing constants and colour helpers live in ./timing.mjs so the
+   keyframe math can be tested without a browser. */
 
 /* =============================== assets =================================== */
 const ART = '../../artifacts/';
+
+/** fetch that fails loudly on 404 instead of handing a "not found" body to .json()/.text(). */
+async function fetchOk(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} fetching ${url}`);
+  return res;
+}
 
 function loadImage(src) {
   return new Promise((res, rej) => {
@@ -121,7 +126,7 @@ function loadImage(src) {
  * the M-15 markup entirely — the intro animates that corridor itself.
  */
 async function loadMapBackdrop() {
-  const svg = await (await fetch(ART + 'bih-motorway-m15-glamoc-livno-segment.svg')).text();
+  const svg = await (await fetchOk(ART + 'bih-motorway-m15-glamoc-livno-segment.svg')).text();
   const themed = svg
     .replace(/<rect\b[^>]*id="rect3"[^>]*\/>/s, '')     // drop the grey page plate
     .replace(/fill="#FEFEE9"/gi, 'data-bih="1" fill="#0a2733"')  // landmass, tagged
@@ -141,7 +146,11 @@ async function loadMapBackdrop() {
   holder.remove();
 
   const url = URL.createObjectURL(new Blob([themed], { type: 'image/svg+xml' }));
-  return { img: await loadImage(url), bbox: b && { x: b.x, y: b.y, w: b.width, h: b.height } };
+  try {
+    return { img: await loadImage(url), bbox: b && { x: b.x, y: b.y, w: b.width, h: b.height } };
+  } finally {
+    URL.revokeObjectURL(url);   // the decoded image outlives the blob URL
+  }
 }
 
 /**
@@ -158,9 +167,10 @@ async function loadCoverageMask() {
   c.drawImage(img, 0, 0, N, N);
   const data = c.getImageData(0, 0, N, N);
   const px = data.data;
+  const [OR, OG, OB] = hexToRgb(ORANGE);
   for (let i = 0; i < px.length; i += 4) {
     const covered = px[i] > 60 && px[i] < 160;   // grey plateau = has service
-    if (covered) { px[i] = 0xf5; px[i + 1] = 0x82; px[i + 2] = 0x1f; px[i + 3] = 255; }
+    if (covered) { px[i] = OR; px[i + 1] = OG; px[i + 2] = OB; px[i + 3] = 255; }
     else px[i + 3] = 0;
   }
   c.putImageData(data, 0, 0);
@@ -168,14 +178,13 @@ async function loadCoverageMask() {
 }
 
 const assets = {};
-const routePromise = fetch('./route.json').then((r) => r.json());
 
 window.INTRO = {
   fps: FPS,
   frames: FRAMES,
   ready: (async () => {
     const [route, map, coverage, logo] = await Promise.all([
-      routePromise,
+      fetchOk('./route.json').then((r) => r.json()),
       loadMapBackdrop(),
       loadCoverageMask(),
       loadImage(ART + 'bht-logo.svg'),
@@ -330,7 +339,7 @@ function drawRoute(t) {
       const g = ctx.createRadialGradient(px, py, 0, px, py, r * 3.4);
       g.addColorStop(0, '#fff4e2');
       g.addColorStop(0.35, ORANGE);
-      g.addColorStop(1, 'rgba(245,130,31,0)');
+      g.addColorStop(1, rgba(ORANGE, 0));
       ctx.fillStyle = g;
       ctx.beginPath(); ctx.arc(px, py, r * 3.4, 0, Math.PI * 2); ctx.fill();
     });
@@ -412,8 +421,8 @@ function drawScanSweep(t) {
   const a = Math.sin(p * Math.PI) * 0.9;
   withAlpha(a, () => {
     const g = ctx.createLinearGradient(0, y - 70, 0, y + 8);
-    g.addColorStop(0, 'rgba(56,225,255,0)');
-    g.addColorStop(1, 'rgba(56,225,255,0.30)');
+    g.addColorStop(0, rgba(CYAN, 0));
+    g.addColorStop(1, rgba(CYAN, 0.30));
     ctx.fillStyle = g;
     ctx.fillRect(MAP.x - 60, y - 70, MAP.w + 120, 78);
     ctx.strokeStyle = '#bff2ff';
@@ -575,7 +584,7 @@ function drawGlass(t) {
 /* ================================ frame =================================== */
 
 function seek(frame) {
-  const t = Math.max(0, Math.min(FRAMES - 1, frame)) / FPS;
+  const t = frameToTime(frame);
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
@@ -597,22 +606,34 @@ function seek(frame) {
 /* ============================ preview harness ============================= */
 
 const params = new URLSearchParams(location.search);
-if (params.get('render') === '1') document.body.classList.add('render');
+const isRender = params.get('render') === '1';
+if (isRender) document.body.classList.add('render');
 
 const scrub = document.getElementById('scrub');
 const readout = document.getElementById('readout');
 const playBtn = document.getElementById('play');
 scrub.max = String(FRAMES - 1);
+readout.textContent = `frame 0 / ${FRAMES - 1} · 0.00s`;
 
 function show(frame) {
   seek(frame);
+  // Under ?render=1 the HUD is hidden; skip 300 pointless DOM writes per run.
+  if (isRender) return;
   scrub.value = String(frame);
-  readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${(frame / FPS).toFixed(2)}s`;
+  readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${frameToTime(frame).toFixed(2)}s`;
 }
 
-await window.INTRO.ready;
-show(0);
-window.__introReady = true;   // render.mjs waits on this flag
+// render.mjs waits on one of these two flags. Without the error channel a
+// failed asset just leaves __introReady unset and the render stalls for the
+// full 60s timeout with nothing to show for it.
+try {
+  await window.INTRO.ready;
+  show(0);
+  window.__introReady = true;
+} catch (e) {
+  window.__introError = e && e.message ? e.message : String(e);
+  console.error('intro assets failed:', e);
+}
 
 scrub.addEventListener('input', () => show(Number(scrub.value)));
 
