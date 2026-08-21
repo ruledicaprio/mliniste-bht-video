@@ -1,6 +1,29 @@
+<<<<<<< HEAD
 *.mp4
 package-lock.json
 .\node_modules\
 .\package-lock.json
 .\animation\intro\frames
 \animation\intro\frames
+=======
+```
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# Package manager
+package-lock.json
+```
+>>>>>>> c1012a6c364eec770561448ee78ff70fbef37ca2
