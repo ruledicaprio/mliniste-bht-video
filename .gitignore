@@ -1,7 +1,20 @@
-*.mp4
-*.png
+```
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# Package manager
 package-lock.json
-*.jpeg
-*.jpg
-.\node_modules\
-.\package-lock.json
+```
