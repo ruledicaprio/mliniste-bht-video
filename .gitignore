@@ -1,7 +1,4 @@
 *.mp4
-*.png
 package-lock.json
-*.jpeg
-*.jpg
 .\node_modules\
 .\package-lock.json
