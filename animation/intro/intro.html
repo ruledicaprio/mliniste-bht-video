@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="bs">
+<head>
+<meta charset="utf-8">
+<title>Mlinište — Intro HUD</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #000;
+    height: 100%;
+    overflow: hidden;
+  }
+  /* The canvas is always 1920x1080 internally; CSS only scales it for preview. */
+  #stage {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  canvas {
+    width: min(100vw, calc(100vh * 16 / 9));
+    height: auto;
+    display: block;
+  }
+  /* Preview-only scrub bar. render.mjs hides it via ?render=1. */
+  #hud {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 10px 16px;
+    background: rgba(0,0,0,.7);
+    color: #9fe8ff;
+    font: 12px ui-monospace, "Cascadia Mono", Consolas, monospace;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  #hud input { flex: 1; }
+  #hud button { font: inherit; background: #123; color: #9fe8ff; border: 1px solid #2a5c6b; padding: 3px 10px; cursor: pointer; }
+  body.render #hud { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div id="hud">
+  <button id="play">play</button>
+  <input id="scrub" type="range" min="0" max="299" value="0" step="1">
+  <span id="readout">frame 0 / 299 · 0.00s</span>
+</div>
+
+<script type="module">
+/* =============================================================================
+   MLINIŠTE — INTRO HUD SEQUENCE
+   BH Telecom · M-15 Glamoč–Livno · 44°15'55.34"N 16°51'05.62"E · 1155 m
+
+   Deterministic frame renderer: every visual is a pure function of the frame
+   index. Nothing reads the wall clock during a render, so a headless pass and
+   the live preview produce identical pixels.
+
+     window.INTRO.seek(frame)  -> draws exactly that frame
+     window.INTRO.ready        -> resolves once every asset is decoded
+   ========================================================================== */
+
+const FPS = 30;
+const DUR = 10;                    // seconds
+const FRAMES = FPS * DUR;          // 300
+const W = 1920, H = 1080;
+
+/* --- palette ------------------------------------------------------------- */
+const ORANGE = '#f5821f';          // BH Telecom brand orange (bht-logo.svg)
+const CYAN   = '#38e1ff';
+const DIM    = '#1d6f86';
+const INK    = '#04141a';
+
+/* --- where the site sits on the traced corridor ---------------------------
+   Mlinište pass is a fraction along the M-15 markup polyline, measured from its
+   northern end. Nudge SITE_T if the reticle should sit further up or down the
+   corridor — everything else (callout, coverage bloom origin) follows it.      */
+const SITE_T = 0.597;
+
+/** The one label the site gets. Everything else was noise. */
+const SITE_LABEL = 'MLINIŠTE_MIKRO';
+
+/* --- national coverage raster registration --------------------------------
+   bht-coverage-raster-photo.png is a 4000x4000 plate whose grey pixels are the
+   covered area of BiH. These fractions are the bounding box of that grey region
+   (measured once with ffmpeg + a pixel scan); the raster is stretched so this
+   box lands on the BiH landmass of the map SVG, keeping both in one region.    */
+const COVERAGE_BOX = { x0: 0.251, y0: 0.154, x1: 0.973, y1: 0.919 };
+
+/* --- map placement on the 1920x1080 frame --------------------------------- */
+const MAP = { x: 210, y: 40, w: 1000, h: 1000 };
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+/* =============================== easing =================================== */
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+/** Normalized progress of t through [a,b], clamped to 0..1. */
+const ramp = (t, a, b) => clamp01((t - a) / (b - a));
+const easeOut = (p) => 1 - Math.pow(1 - p, 3);
+const easeInOut = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+/** Ramps up over [a,b] and back down over [c,d] — a windowed opacity. */
+const window4 = (t, a, b, c, d) => Math.min(easeOut(ramp(t, a, b)), 1 - easeInOut(ramp(t, c, d)));
+const lerp = (a, b, p) => a + (b - a) * p;
+
+/* =============================== assets =================================== */
+const ART = '../../artifacts/';
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = () => rej(new Error('failed to load ' + src));
+    img.src = src;
+  });
+}
+
+/**
+ * The national map SVG ships as a printable atlas (grey plate, cream landmass,
+ * orange road network). Recolor it in-place into a dark HUD backdrop, and drop
+ * the M-15 markup entirely — the intro animates that corridor itself.
+ */
+async function loadMapBackdrop() {
+  const svg = await (await fetch(ART + 'bih-motorway-m15-glamoc-livno-segment.svg')).text();
+  const themed = svg
+    .replace(/<rect\b[^>]*id="rect3"[^>]*\/>/s, '')     // drop the grey page plate
+    .replace(/fill="#FEFEE9"/gi, 'data-bih="1" fill="#0a2733"')  // landmass, tagged
+    .replace(/#FEFEE9/gi, '#0a2733')
+    .replace(/#C6ECFF/gi, '#061c25')                     // water
+    .replace(/#ff6600/gi, DIM)                           // magistralni network, dimmed
+    .replace(/#803300/gi, 'none');                       // M-15 markup: we draw it
+
+  // Measure the BiH landmass in SVG user units by mounting the themed SVG
+  // off-screen — getBBox is exact, and beats guessing at the country's extent.
+  const holder = document.createElement('div');
+  holder.style.cssText = 'position:absolute;left:-99999px;top:0;width:1000px;height:1000px';
+  holder.innerHTML = themed;
+  document.body.appendChild(holder);
+  const bihEl = holder.querySelector('[data-bih]');
+  const b = bihEl ? bihEl.getBBox() : null;
+  holder.remove();
+
+  const url = URL.createObjectURL(new Blob([themed], { type: 'image/svg+xml' }));
+  return { img: await loadImage(url), bbox: b && { x: b.x, y: b.y, w: b.width, h: b.height } };
+}
+
+/**
+ * Turns the national coverage plate into a premultiplied orange mask: grey
+ * (covered) becomes brand orange at full alpha, everything else transparent.
+ * Downsampled to 1400px — it is only ever drawn about 900px wide.
+ */
+async function loadCoverageMask() {
+  const img = await loadImage(ART + 'bht-coverage-raster-photo.png');
+  const N = 1400;
+  const off = document.createElement('canvas');
+  off.width = off.height = N;
+  const c = off.getContext('2d', { willReadFrequently: true });
+  c.drawImage(img, 0, 0, N, N);
+  const data = c.getImageData(0, 0, N, N);
+  const px = data.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const covered = px[i] > 60 && px[i] < 160;   // grey plateau = has service
+    if (covered) { px[i] = 0xf5; px[i + 1] = 0x82; px[i + 2] = 0x1f; px[i + 3] = 255; }
+    else px[i + 3] = 0;
+  }
+  c.putImageData(data, 0, 0);
+  return off;
+}
+
+const assets = {};
+const routePromise = fetch('./route.json').then((r) => r.json());
+
+window.INTRO = {
+  fps: FPS,
+  frames: FRAMES,
+  ready: (async () => {
+    const [route, map, coverage, logo] = await Promise.all([
+      routePromise,
+      loadMapBackdrop(),
+      loadCoverageMask(),
+      loadImage(ART + 'bht-logo.svg'),
+    ]);
+    assets.route = prepareRoute(route);
+    assets.map = map.img;
+    assets.bih = mapBoxToScreen(map.bbox);
+    assets.coverage = coverage;
+    assets.logo = logo;
+    // Warm the font stack so the first rendered frame measures text identically.
+    ctx.font = '400 20px ui-monospace, Consolas, monospace';
+    ctx.measureText('warm');
+  })(),
+  seek,
+};
+
+/* ============================ route geometry ============================== */
+
+/**
+ * Maps the corridor polyline from SVG user units into frame coordinates and
+ * precomputes cumulative arc length, so the trace can be drawn by distance
+ * rather than by vertex index (constant apparent speed regardless of spacing).
+ */
+function prepareRoute(route) {
+  const vb = route.viewBox;
+  const scale = Math.min(MAP.w / vb.width, MAP.h / vb.height);
+  const ox = MAP.x + (MAP.w - vb.width * scale) / 2;
+  const oy = MAP.y + (MAP.h - vb.height * scale) / 2;
+
+  const pts = route.points.map(([x, y]) => [ox + x * scale, oy + y * scale]);
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  }
+  return { pts, cum, total: cum.at(-1), scale, ox, oy, vb };
+}
+
+/** Converts a rect in SVG user units into frame coordinates. */
+function mapBoxToScreen(b) {
+  if (!b) return null;
+  const { scale, ox, oy } = assets.route;
+  return { x: ox + b.x * scale, y: oy + b.y * scale, w: b.w * scale, h: b.h * scale };
+}
+
+/** Point at arc-length fraction f (0..1) along the corridor. */
+function pointAt(f) {
+  const { pts, cum, total } = assets.route;
+  const target = clamp01(f) * total;
+  let i = 1;
+  while (i < cum.length - 1 && cum[i] < target) i++;
+  const span = cum[i] - cum[i - 1] || 1;
+  const p = (target - cum[i - 1]) / span;
+  return [lerp(pts[i - 1][0], pts[i][0], p), lerp(pts[i - 1][1], pts[i][1], p)];
+}
+
+/** Traces the corridor from its start up to arc-length fraction f. */
+function strokeRoute(f) {
+  const { pts, cum, total } = assets.route;
+  const target = clamp01(f) * total;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) {
+    if (cum[i] <= target) { ctx.lineTo(pts[i][0], pts[i][1]); continue; }
+    const span = cum[i] - cum[i - 1] || 1;
+    const p = (target - cum[i - 1]) / span;
+    ctx.lineTo(lerp(pts[i - 1][0], pts[i][0], p), lerp(pts[i - 1][1], pts[i][1], p));
+    break;
+  }
+  ctx.stroke();
+}
+
+/* ============================= draw helpers =============================== */
+
+function withAlpha(a, fn) {
+  if (a <= 0.001) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  fn();
+  ctx.restore();
+}
+
+function mono(size, weight = 400, spacing = 0) {
+  ctx.font = `${weight} ${size}px ui-monospace, "Cascadia Mono", Consolas, monospace`;
+  ctx.letterSpacing = `${spacing}px`;
+}
+
+/** Reveals `text` character-by-character as p goes 0..1 (terminal type-on). */
+function typed(text, p) {
+  return text.slice(0, Math.round(clamp01(p) * text.length));
+}
+
+/* ================================ layers ================================== */
+
+function drawBackdropGrid(t) {
+  const a = window4(t, 0, 0.7, 8.2, 9.2) * 0.5;
+  withAlpha(a, () => {
+    ctx.strokeStyle = '#0d3a48';
+    ctx.lineWidth = 1;
+    // Grid lines sweep outward from center as the sequence ignites.
+    const spread = easeOut(ramp(t, 0, 1.1));
+    const step = 60;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += step) {
+      const dx = (x - W / 2) * spread + W / 2;
+      ctx.moveTo(dx, 0); ctx.lineTo(dx, H);
+    }
+    for (let y = 0; y <= H; y += step) {
+      const dy = (y - H / 2) * spread + H / 2;
+      ctx.moveTo(0, dy); ctx.lineTo(W, dy);
+    }
+    ctx.stroke();
+  });
+}
+
+function drawMap(t) {
+  const a = window4(t, 0.6, 1.7, 8.6, 9.4);
+  if (a <= 0.001) return;
+  const grow = lerp(0.955, 1, easeOut(ramp(t, 0.6, 2.2)));
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(MAP.x + MAP.w / 2, MAP.y + MAP.h / 2);
+  ctx.scale(grow, grow);
+  ctx.translate(-(MAP.x + MAP.w / 2), -(MAP.y + MAP.h / 2));
+  ctx.drawImage(assets.map, MAP.x, MAP.y, MAP.w, MAP.h);
+  ctx.restore();
+}
+
+function drawRoute(t) {
+  const f = easeInOut(ramp(t, 1.2, 3.5));
+  if (f <= 0) return;
+  const fade = window4(t, 1.2, 1.4, 8.6, 9.4);
+
+  withAlpha(fade * 0.35, () => {                    // outer bloom
+    ctx.strokeStyle = ORANGE;
+    ctx.lineWidth = 14;
+    ctx.lineJoin = ctx.lineCap = 'round';
+    ctx.filter = 'blur(7px)';
+    strokeRoute(f);
+  });
+  withAlpha(fade, () => {                           // hot core
+    ctx.strokeStyle = '#ffd9a8';
+    ctx.lineWidth = 3.4;
+    ctx.lineJoin = ctx.lineCap = 'round';
+    strokeRoute(f);
+  });
+
+  // Leading pulse, only while the trace is still drawing.
+  if (f < 1) {
+    const [px, py] = pointAt(f);
+    withAlpha(fade, () => {
+      const r = 7 + Math.sin(t * 14) * 1.6;
+      const g = ctx.createRadialGradient(px, py, 0, px, py, r * 3.4);
+      g.addColorStop(0, '#fff4e2');
+      g.addColorStop(0.35, ORANGE);
+      g.addColorStop(1, 'rgba(245,130,31,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(px, py, r * 3.4, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+}
+
+function drawSiteLock(t) {
+  const a = window4(t, 2.9, 3.6, 8.4, 9.2);
+  if (a <= 0.001) return;
+  const [sx, sy] = pointAt(SITE_T);
+  const settle = easeOut(ramp(t, 2.9, 3.9));
+
+  withAlpha(a, () => {
+    ctx.translate(sx, sy);
+
+    // Lock brackets slam inward from 3x to final size.
+    const s = lerp(3, 1, settle);
+    const half = 34 * s;
+    ctx.strokeStyle = ORANGE;
+    ctx.lineWidth = 2.5;
+    const arm = 14;
+    for (const [mx, my] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      ctx.beginPath();
+      ctx.moveTo(mx * half, my * half - my * arm);
+      ctx.lineTo(mx * half, my * half);
+      ctx.lineTo(mx * half - mx * arm, my * half);
+      ctx.stroke();
+    }
+
+    // Slowly rotating reticle ring + tick marks.
+    ctx.strokeStyle = CYAN;
+    ctx.lineWidth = 1.4;
+    ctx.globalAlpha *= 0.85;
+    ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI * 2); ctx.stroke();
+    ctx.save();
+    ctx.rotate(t * 0.9);
+    for (let i = 0; i < 12; i++) {
+      ctx.rotate(Math.PI / 6);
+      ctx.beginPath(); ctx.moveTo(0, -26); ctx.lineTo(0, -32); ctx.stroke();
+    }
+    ctx.restore();
+
+    // Crosshair + centre pip.
+    ctx.beginPath();
+    ctx.moveTo(-16, 0); ctx.lineTo(-5, 0);
+    ctx.moveTo(5, 0); ctx.lineTo(16, 0);
+    ctx.moveTo(0, -16); ctx.lineTo(0, -5);
+    ctx.moveTo(0, 5); ctx.lineTo(0, 16);
+    ctx.stroke();
+    ctx.fillStyle = ORANGE;
+    ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, Math.PI * 2); ctx.fill();
+  });
+
+  // Callout: elbow leader from the reticle out to the right-hand label block.
+  const lead = easeOut(ramp(t, 3.5, 4.2));
+  const elbowX = sx + 90, labelX = elbowX + 150 * lead, labelY = sy - 92;
+  withAlpha(a * lead, () => {
+    ctx.strokeStyle = CYAN;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(sx + 40, sy - 40);
+    ctx.lineTo(elbowX, labelY);
+    ctx.lineTo(labelX, labelY);
+    ctx.stroke();
+  });
+
+  withAlpha(a, () => {
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#eaf8ff';
+    mono(34, 700, 3);
+    ctx.fillText(typed(SITE_LABEL, ramp(t, 3.9, 4.6)), elbowX + 8, labelY - 14);
+  });
+}
+
+function drawScanSweep(t) {
+  const p = ramp(t, 4.0, 5.6);
+  if (p <= 0 || p >= 1) return;
+  const y = MAP.y - 40 + (MAP.h + 80) * easeInOut(p);
+  const a = Math.sin(p * Math.PI) * 0.9;
+  withAlpha(a, () => {
+    const g = ctx.createLinearGradient(0, y - 70, 0, y + 8);
+    g.addColorStop(0, 'rgba(56,225,255,0)');
+    g.addColorStop(1, 'rgba(56,225,255,0.30)');
+    ctx.fillStyle = g;
+    ctx.fillRect(MAP.x - 60, y - 70, MAP.w + 120, 78);
+    ctx.strokeStyle = '#bff2ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(MAP.x - 60, y); ctx.lineTo(MAP.x + MAP.w + 60, y); ctx.stroke();
+  });
+}
+
+const TELEMETRY = [
+  ['LOKACIJA',   'BTS MLINIŠTE'],
+  ['TEREN',      'PLANINSKI PRIJEVOJ · 1155 m'],
+  ['PRISTUP',    'M-15 · ZIMSKI REŽIM'],
+  ['NAPAJANJE',  'HIBRID: PV + GENSET + BATERIJA'],
+  ['AUTONOMIJA', '72 h BEZ INTERVENCIJE'],
+  ['SERVIS',     'GSM · UMTS · LTE'],
+];
+
+function drawTelemetry(t) {
+  const a = window4(t, 3.6, 4.2, 6.4, 7.2);
+  if (a <= 0.001) return;
+  const x = 1330, top = 300;
+  withAlpha(a, () => {
+    // Panel plate + left rule.
+    ctx.fillStyle = 'rgba(4,20,26,0.72)';
+    ctx.fillRect(x - 26, top - 62, 470, 62 + TELEMETRY.length * 54 + 24);
+    ctx.fillStyle = ORANGE;
+    ctx.fillRect(x - 26, top - 62, 4, 62 + TELEMETRY.length * 54 + 24);
+
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = ORANGE;
+    mono(17, 700, 5);
+    ctx.fillText(typed('STATUS LOKACIJE', ramp(t, 3.7, 4.2)), x, top - 28);
+
+    TELEMETRY.forEach(([k, v], i) => {
+      const p = ramp(t, 4.2 + i * 0.18, 4.7 + i * 0.18);
+      if (p <= 0) return;
+      const y = top + i * 54;
+      ctx.globalAlpha = a * p;
+      ctx.fillStyle = '#5fb5cc';
+      mono(15, 400, 3);
+      ctx.fillText(k, x, y);
+      ctx.fillStyle = '#eaf8ff';
+      mono(22, 400, 0.5);
+      ctx.fillText(typed(v, p), x, y + 28);
+      ctx.globalAlpha = a;
+    });
+  });
+}
+
+function drawCoverage(t) {
+  const a = window4(t, 6.0, 7.0, 8.6, 9.3);
+  if (a <= 0.001) return;
+  const [sx, sy] = pointAt(SITE_T);
+  // Radial wipe: coverage floods outward from the site until all of BiH is lit.
+  const reveal = easeOut(ramp(t, 6.0, 8.0)) * 1500;
+
+  // Stretch the raster so its covered-area bbox sits on the map's BiH outline.
+  const box = assets.bih;
+  if (box) {
+    const src = assets.coverage;
+    const fw = COVERAGE_BOX.x1 - COVERAGE_BOX.x0;
+    const fh = COVERAGE_BOX.y1 - COVERAGE_BOX.y0;
+    const dw = box.w / fw, dh = box.h / fh;
+    const dx = box.x - COVERAGE_BOX.x0 * dw, dy = box.y - COVERAGE_BOX.y0 * dh;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(sx, sy, reveal, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.globalAlpha = a * 0.45;                 // body fill
+    ctx.drawImage(src, dx, dy, dw, dh);
+    ctx.globalAlpha = a * 0.30;                 // additive bloom on top
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(src, dx, dy, dw, dh);
+    ctx.restore();
+  }
+
+  // Three staggered propagation rings launched from the site.
+  for (let i = 0; i < 3; i++) {
+    const p = ramp(t, 6.1 + i * 0.42, 7.9 + i * 0.42);
+    if (p <= 0 || p >= 1) continue;
+    withAlpha(a * (1 - p) * 0.8, () => {
+      ctx.strokeStyle = ORANGE;
+      ctx.lineWidth = lerp(4, 1, p);
+      ctx.beginPath(); ctx.arc(sx, sy, easeOut(p) * 900, 0, Math.PI * 2); ctx.stroke();
+    });
+  }
+
+  // Service legend.
+  const chips = [['GSM', '#7ad1ff'], ['UMTS', '#ffd26a'], ['LTE', ORANGE]];
+  chips.forEach(([label, color], i) => {
+    const p = ramp(t, 7.0 + i * 0.16, 7.5 + i * 0.16);
+    withAlpha(a * p, () => {
+      const cx = 150 + i * 150, cy = 980;
+      ctx.fillStyle = 'rgba(4,20,26,0.8)';
+      ctx.fillRect(cx - 20, cy - 30, 126, 46);
+      ctx.fillStyle = color;
+      ctx.fillRect(cx - 20, cy - 30, 6, 46);
+      ctx.fillStyle = '#eaf8ff';
+      mono(22, 700, 3);
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(label, cx, cy);
+    });
+  });
+}
+
+function drawOutro(t) {
+  const scrim = ramp(t, 8.4, 9.2) * 0.88;
+  withAlpha(scrim, () => { ctx.fillStyle = '#02090c'; ctx.fillRect(0, 0, W, H); });
+
+  const a = easeOut(ramp(t, 8.6, 9.4));
+  if (a <= 0.001) return;
+
+  // Logo: settles up into place as it fades in.
+  const lw = 520, lh = lw * (100.308 / 206.25372);
+  const rise = lerp(28, 0, easeOut(ramp(t, 8.6, 9.5)));
+  withAlpha(a, () => {
+    ctx.drawImage(assets.logo, (W - lw) / 2, 400 + rise, lw, lh);
+  });
+
+  // Tagline: letterspacing tightens as it resolves.
+  const tp = ramp(t, 9.0, 9.9);
+  withAlpha(easeOut(tp), () => {
+    ctx.fillStyle = '#eaf8ff';
+    ctx.textAlign = 'center';
+    mono(40, 700, lerp(26, 9, easeOut(tp)));
+    ctx.fillText('IZA PLANINE ISPORUČUJEMO VIŠE', W / 2, 640);
+    ctx.textAlign = 'left';
+  });
+
+  withAlpha(easeOut(ramp(t, 9.3, 10)) * 0.75, () => {
+    ctx.fillStyle = ORANGE;
+    ctx.textAlign = 'center';
+    mono(18, 400, 6);
+    ctx.fillText('MLINIŠTE  ·  44°15\'55"N  16°51\'05"E  ·  1155 m', W / 2, 700);
+    ctx.textAlign = 'left';
+  });
+}
+
+/** Scanlines + vignette, applied last so everything sits under the same glass. */
+function drawGlass(t) {
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  ctx.fillStyle = '#7fe4ff';
+  for (let y = 0; y < H; y += 4) ctx.fillRect(0, y, W, 1);
+  ctx.restore();
+
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.75)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // Opening and closing dips to black keep the clip cuttable at either end.
+  const fade = Math.max(1 - ramp(t, 0, 0.35), ramp(t, 9.75, 10));
+  if (fade > 0) { ctx.globalAlpha = fade; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+}
+
+/* ================================ frame =================================== */
+
+function seek(frame) {
+  const t = Math.max(0, Math.min(FRAMES - 1, frame)) / FPS;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.filter = 'none';
+  ctx.fillStyle = INK;
+  ctx.fillRect(0, 0, W, H);
+
+  drawBackdropGrid(t);
+  drawMap(t);
+  drawRoute(t);
+  drawScanSweep(t);
+  drawSiteLock(t);
+  // drawTelemetry(t);   // site spec panel — cut as clutter; re-enable to restore
+  drawCoverage(t);
+  drawOutro(t);
+  drawGlass(t);
+}
+
+/* ============================ preview harness ============================= */
+
+const params = new URLSearchParams(location.search);
+if (params.get('render') === '1') document.body.classList.add('render');
+
+const scrub = document.getElementById('scrub');
+const readout = document.getElementById('readout');
+const playBtn = document.getElementById('play');
+scrub.max = String(FRAMES - 1);
+
+function show(frame) {
+  seek(frame);
+  scrub.value = String(frame);
+  readout.textContent = `frame ${frame} / ${FRAMES - 1} · ${(frame / FPS).toFixed(2)}s`;
+}
+
+await window.INTRO.ready;
+show(0);
+window.__introReady = true;   // render.mjs waits on this flag
+
+scrub.addEventListener('input', () => show(Number(scrub.value)));
+
+let playing = false, raf = 0;
+playBtn.addEventListener('click', () => {
+  playing = !playing;
+  playBtn.textContent = playing ? 'pause' : 'play';
+  if (!playing) { cancelAnimationFrame(raf); return; }
+  const t0 = performance.now() - (Number(scrub.value) / FPS) * 1000;
+  const tick = (now) => {
+    if (!playing) return;
+    const f = Math.floor(((now - t0) / 1000) * FPS);
+    if (f >= FRAMES) { playing = false; playBtn.textContent = 'play'; show(FRAMES - 1); return; }
+    show(f);
+    raf = requestAnimationFrame(tick);
+  };
+  raf = requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>
