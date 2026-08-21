@@ -1,0 +1,156 @@
+// Headless frame render: drives a piece's page one frame at a time through the
+// locally installed Chrome, dumps 1920x1080 PNGs, then muxes them with ffmpeg.
+//
+// Frames come off the canvas via toDataURL, not page.screenshot, so the output
+// is exact canvas pixels regardless of how CSS scales the element for preview.
+
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import puppeteer from 'puppeteer-core';
+import { startServer, pagePath } from './server.mjs';
+import { runFfmpeg } from './ffmpeg.mjs';
+
+const PNG_PREFIX = 'data:image/png;base64,';
+
+const CHROME_CANDIDATES = [
+  // Windows
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  process.env.LOCALAPPDATA && `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  // macOS
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  // Linux
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/microsoft-edge',
+].filter(Boolean);
+
+export function findChrome() {
+  // An explicit CHROME_PATH is an override, not a hint: if it is wrong, say so
+  // rather than quietly rendering through some other browser.
+  if (process.env.CHROME_PATH) {
+    if (!existsSync(process.env.CHROME_PATH)) {
+      throw new Error(`CHROME_PATH is set but does not exist: ${process.env.CHROME_PATH}`);
+    }
+    return process.env.CHROME_PATH;
+  }
+  for (const p of CHROME_CANDIDATES) {
+    if (existsSync(p)) return p;
+  }
+  throw new Error('No Chrome/Edge found. Set CHROME_PATH to a browser executable.');
+}
+
+/**
+ * Renders one piece to PNG frames and (unless --no-video) an MP4.
+ *
+ * @param piece     'intro' | 'outro' — names both the page and the npm scripts
+ * @param pieceDir  absolute path of the piece's directory
+ * @param plates    the piece's createPlates() result, for the staleness check
+ * @param outName   basename of the MP4 written into pieceDir
+ */
+export async function renderPiece({ piece, pieceDir, plates, outName }) {
+  const FRAME_DIR = resolve(pieceDir, 'frames');
+  const OUT_MP4 = resolve(pieceDir, outName);
+  const makeVideo = !process.argv.includes('--no-video');
+
+  // Resolve the browser before touching the filesystem or opening a socket, so
+  // a missing Chrome fails immediately instead of leaving a listening server
+  // whose open handle keeps the process alive forever.
+  const chrome = findChrome();
+
+  // A missing or stale plate cache would otherwise render as silently black
+  // footage phases — seconds of nothing, discovered only on playback.
+  const stale = plates.stalePhases();
+  if (stale.length) {
+    console.error(
+      `footage plates are missing or out of date for: ${stale.join(', ')}\n` +
+      `  Run \`npm run plates:${piece}\` first (it needs the source clips on disk).`
+    );
+    process.exit(1);
+  }
+
+  rmSync(FRAME_DIR, { recursive: true, force: true });
+  mkdirSync(FRAME_DIR, { recursive: true });
+
+  let server = null;
+  let browser = null;
+  let fps;
+
+  try {
+    server = await startServer();
+    browser = await puppeteer.launch({
+      executablePath: chrome,
+      headless: true,
+      args: ['--hide-scrollbars', '--force-color-profile=srgb', '--disable-lcd-text'],
+    });
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
+    page.on('pageerror', (e) => console.error('page error:', e.message));
+
+    await page.goto(`${server.origin}${pagePath(piece)}?render=1`, { waitUntil: 'load' });
+
+    // The page reports failure explicitly; without this a broken asset just
+    // sits here until the timeout and reports nothing useful.
+    await page.waitForFunction(
+      'window.__sceneReady === true || window.__sceneError !== undefined',
+      { timeout: 60_000 }
+    );
+    const pageError = await page.evaluate('window.__sceneError ?? null');
+    if (pageError) throw new Error(`${piece} page failed to load its assets: ${pageError}`);
+
+    const frames = await page.evaluate('window.SCENE.frames');
+    fps = await page.evaluate('window.SCENE.fps');
+    console.log(`rendering ${frames} frames at 1920x1080, ${fps}fps...`);
+
+    for (let f = 0; f < frames; f++) {
+      const dataUrl = await page.evaluate(async (n) => {
+        await window.SCENE.seek(n);
+        return document.getElementById('c').toDataURL('image/png');
+      }, f);
+      if (!dataUrl.startsWith(PNG_PREFIX)) {
+        throw new Error(`frame ${f}: canvas did not return a PNG data URL (got "${dataUrl.slice(0, 32)}...")`);
+      }
+      writeFileSync(
+        resolve(FRAME_DIR, `frame_${String(f).padStart(4, '0')}.png`),
+        Buffer.from(dataUrl.slice(PNG_PREFIX.length), 'base64')
+      );
+      if (f % 30 === 0 || f === frames - 1) process.stdout.write(`\r  ${f + 1}/${frames}`);
+    }
+    process.stdout.write('\n');
+  } finally {
+    // Independently, so a failure closing one still releases the other.
+    if (browser) await browser.close().catch((e) => console.error('browser close:', e.message));
+    if (server) await server.close().catch((e) => console.error('server close:', e.message));
+  }
+
+  if (!makeVideo) {
+    console.log(`frames written to ${FRAME_DIR}`);
+    return;
+  }
+
+  try {
+    runFfmpeg([
+      '-y',
+      '-framerate', String(fps),
+      '-i', resolve(FRAME_DIR, 'frame_%04d.png'),
+      '-c:v', 'libx264',
+      '-preset', 'slow',
+      '-crf', '16',
+      '-pix_fmt', 'yuv420p',
+      '-r', String(fps),
+      '-movflags', '+faststart',
+      OUT_MP4,
+    ]);
+  } catch (e) {
+    console.error(e.message);
+    console.error(`frames are still in ${FRAME_DIR}`);
+    process.exit(1);
+  }
+  console.log(`\ndone: ${OUT_MP4}`);
+}

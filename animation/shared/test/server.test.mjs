@@ -1,7 +1,9 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
-import { startServer, PAGE_PATH, isInsideRoot, resolveRequestPath } from '../server.mjs';
+import { startServer, pagePath, isInsideRoot, resolveRequestPath } from '../server.mjs';
+
+const PAGE_PATH = pagePath('intro');
 
 let server;
 before(async () => { server = await startServer(); });
@@ -54,25 +56,25 @@ test('serves the intro page', async () => {
 });
 
 test('serves route.json as application/json', async () => {
-  const res = await raw('/animation/intro/route.json');
+  const res = await raw('/animation/shared/route.json');
   assert.equal(res.status, 200);
   assert.match(res.type, /^application\/json/);
   assert.equal(JSON.parse(res.body).segments, 3);
 });
 
 test('serves .mjs as javascript so the page can import it', async () => {
-  const res = await raw('/animation/intro/timing.mjs');
+  const res = await raw('/animation/shared/easing.mjs');
   assert.equal(res.status, 200);
   assert.match(res.type, /javascript/);
 });
 
 test('404s a missing file', async () => {
-  const res = await raw('/animation/intro/nope.json');
+  const res = await raw('/animation/shared/nope.json');
   assert.equal(res.status, 404);
 });
 
 test('404s a directory', async () => {
-  const res = await raw('/animation/intro');
+  const res = await raw('/animation/shared');
   assert.equal(res.status, 404);
 });
 
